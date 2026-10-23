@@ -1,0 +1,24 @@
+[Unit]
+Description=Native harness vsock port %i
+Requires=mindos-bindings.service
+After=mindos-bindings.service
+
+[Service]
+User=agent
+Group=agent
+Environment=HOME=/home/agent
+WorkingDirectory=/home/agent
+ExecStart=/usr/bin/socat VSOCK-LISTEN:%i,reuseaddr,fork,max-children=16 EXEC:/usr/local/libexec/harness-%i
+Restart=on-failure
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/home/agent /workspace
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+UMask=0077
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target

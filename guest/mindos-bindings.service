@@ -1,0 +1,13 @@
+[Unit]
+Description=Mount authorized harness volumes and directories
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+Before=harness-vsock@7000.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/mount-bindings
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

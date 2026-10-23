@@ -1,0 +1,23 @@
+#!/bin/bash
+set -euo pipefail
+# The host emits only validated tokens. Never evaluate guest kernel arguments.
+for token in $(cat /proc/cmdline); do
+    case "$token" in
+        mindos.mounts=*) type=ext4 ;;
+        mindos.virtiofs=*) type=virtiofs ;;
+        *) continue ;;
+    esac
+    IFS=, read -ra bindings <<< "${token#*=}"
+    for binding in "${bindings[@]}"; do
+        [[ -n $binding ]] || continue
+        IFS=: read -r name target mode <<< "$binding"
+        [[ $name =~ ^[a-zA-Z0-9-]{1,12}$ ]]
+        [[ $target =~ ^/(workspace|home)/[a-zA-Z0-9/_.-]+$ ]]
+        [[ $target != */../* && $target != */.. && $target != */./* && $target != */. ]]
+        [[ $mode == ro || $mode == rw ]]
+        mkdir -p -- "$target"
+        source="$name"
+        [[ $type != ext4 ]] || source="/dev/disk/by-label/fc-$name"
+        mount -t "$type" -o "$mode,nodev,nosuid" "$source" "$target"
+    done
+done

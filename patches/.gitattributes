@@ -1,0 +1,2 @@
+# Unified diff context lines retain their mandatory leading space.
+*.patch whitespace=-blank-at-eol

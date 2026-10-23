@@ -1,0 +1,3 @@
+#!/bin/sh
+# Replace or add a numbered launcher in a derived image for each native runtime.
+exec /bin/bash --noprofile --norc

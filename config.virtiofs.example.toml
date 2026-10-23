@@ -1,0 +1,33 @@
+listen = "127.0.0.1:8790"
+api_key_env = "FIRECRACKER_API_KEY"
+jailer = "/usr/local/libexec/firecracker-virtiofs/jailer"
+firecracker = "/usr/local/libexec/firecracker-virtiofs/firecracker"
+virtiofsd = "/usr/libexec/virtiofsd"
+state_dir = "/var/lib/mindos-firecracker"
+uid_base = 200000
+max_vms = 4
+
+[profiles.debian13]
+kernel = "/var/lib/mindos-images/vmlinux"
+rootfs = "/var/lib/mindos-images/debian13.ext4"
+vcpus = 2
+memory_mib = 1024
+max_lifetime_secs = 3600
+startup_timeout_secs = 30
+max_connections = 16
+ports = [7000]
+bindings = ["project", "codex"]
+
+[bindings.project]
+backend = "virtiofs"
+source = "/srv/harness/project"
+target = "/workspace/project"
+read_only = false
+
+# The initial fork supports one virtio-fs export per VM. Other bindings may use blocks.
+[bindings.codex]
+backend = "block"
+source = "/srv/harness/codex-home"
+target = "/home/agent/.codex"
+read_only = false
+size_mib = 512

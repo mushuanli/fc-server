@@ -1,0 +1,1305 @@
+diff --git a/docs/virtio-fs.md b/docs/virtio-fs.md
+new file mode 100644
+index 000000000..ec7ac766a
+--- /dev/null
++++ b/docs/virtio-fs.md
+@@ -0,0 +1,161 @@
++# virtio-fs（实验性，单目录）
++
++此分支通过既有 vhost-user 通道转发 FUSE 请求，宿主使用 **Rust virtiofsd**。
++项目或配置/session 目录保持普通目录，文件修改实时落在授权目录中，不导入 ext4。
++Debian 13 的根盘仍可使用 virtio-blk；目录共享与根盘格式互不影响。
++
++## VMM 接口
++
++启动前调用 `PUT /fs/project`：
++
++```json
++{"fs_id":"project","tag":"workspace","socket":"/fs.sock"}
++```
++
++或在 `--config-file` JSON 中加入：
++
++```json
++{"fs":[{"fs_id":"project","tag":"workspace","socket":"/fs.sock"}]}
++```
++
++`fs_id` 必须与 API 路径相同；ID/tag 只接受 ASCII 字母、数字、`_`、`-`，
++tag 为 1–36 字节。同 ID 的启动前配置可替换，第二个 ID 被拒绝。
++204 表示配置已校验，实际连接 backend 在 `InstanceStart` 时进行；它不表示 guest 已挂载。
++`GET /vm/config` 在启动前后均包含 `fs` 配置。
++socket 是 VMM jail 内路径，不是宿主目录；不能用不可信调用方提供的路径配置它。
++
++首版每台 VM 只有 **一个导出目录、一个设备、一个请求队列及一个 hiprio 队列**。
++不支持 DAX、PCI transport、内存热插拔、设备热插拔、设备删除、快照创建/恢复或 backend 重连。
++这些限制有明确错误返回；快照创建在写文件前拒绝，不生成悄悄丢失文件系统设备的快照。
++恢复旧快照不会添加此设备，配置 fs 后调用 snapshot/load 也被启动路径检查拒绝。
++
++若一个 VM 必须同时使用项目及 Codex 配置/session，管理层需要提供经过审核的单一导出根，
++或等待多导出扩展；不能把父目录或整个 HOME 暴露给 guest 来绕过单目录限制。
++不要把该版本描述成已支持多个不同授权/只读策略的独立挂载。
++
++## daemon 与授权边界
++
++VMM 只接受一个受信任的 Unix socket，不接受 source、只读授权或 daemon 命令。
++它不启动、降权或回收 virtiofsd；这些属于管理服务的进程/目录授权边界。
++传入 `read_only` 等未知字段会被拒绝，避免误以为 VMM 在执行目录授权。
++
++管理服务必须：
++
++1. 从管理员预定义绑定选择目录，用 `openat2`/目录 FD 固定无符号链接的源路径；
++   不允许客户端自由提交宿主路径。不能先校验路径再重新按字符串打开源目录。
++2. 每个 VM 使用独立 daemon 和私有 socket，使用 namespace sandbox、seccomp、
++   最小可见挂载集及独立 cgroup。禁止回退 `--sandbox none`。
++3. 只读授权至少使用 virtiofsd 的 `--readonly`，最好同时使用私有 mount namespace
++   中的只读 bind mount；guest 的 `mount -o ro` **不是安全边界**。
++   daemon 版本不支持该参数时应拒绝只读绑定。
++4. 对不可信 guest 不启用 inode-file-handles，显式使用 `--inode-file-handles=never`；
++   不共享包含宿主私有挂载点的目录。目录中的硬链接本身是已导出的 inode，
++   不应预先放入指向私有文件的硬链接；宿主移动已打开 inode 也不撤销已有授权。
++5. 启动 daemon 并确认 socket 就绪后再启动 VMM；创建失败、VM 退出、超时、服务退出及
++   supervisor 死亡均杀死并 wait/reap 整个 daemon 进程组/cgroup，不能只删除 socket。
++6. 权限按真实 UID/GID 实施；单一写入方维护 session。不要宣称同步缓存与多进程并发写入
++   已提供应用级事务、冲突合并或凭据隔离。
++
++Rust virtiofsd 1.14.0 的参考参数：
++
++```sh
++virtiofsd --socket-path /private/fs.sock --shared-dir /authorized/export \
++  --sandbox namespace --seccomp kill --cache never --inode-file-handles=never
++# Read-only authorization adds --readonly; the guest may still mount it with rw.
++```
++
++VMM 为所有 guest RAM 分配 memfd 共享映射，daemon 可访问该 VM 的全部共享内存。
++因此 daemon 是 VM 的受信任组件，不能复用到其他信任域。
++后端握手和激活是同步操作；vhost crate 会重试 EAGAIN，socket 超时不能提供可靠的
++启动截止期。supervisor 必须对整个启动阶段设置截止期，超时杀死 daemon 和 VMM，
++不能仅取消管理 HTTP 请求。断开监控触发 VM 的退出事件，并记录
++`stage=backend category=disconnected action=stop_vm`。退出事件复用现有 VM 停止流程，
++后端失败以退出码 1 结束。supervisor 仍应关联 daemon 退出与错误日志定位原因。
++不重连、不切换目录；daemon 挂死但 socket 未断开的情况由 supervisor 健康/存活时限处理。
++
++## guest 与构建
++
++guest 内核需内建 `CONFIG_FUSE_FS=y`、`CONFIG_VIRTIO_FS=y`、
++`CONFIG_VIRTIO_MMIO=y`，x86 boot cmdline 模式还需 `CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y`。
++本目录的独立构建脚本不修改已有 Linux 源码配置：
++
++```sh
++tools/virtiofs/build-kernel.sh /path/to/pristine/linux /path/to/base.config /path/to/new-output
++cargo build --locked --release --target x86_64-unknown-linux-musl -p firecracker -p jailer
++```
++
++Debian 宿主如 musl 编译缺少 `linux/types.h`，可为该构建命令设置
++`CFLAGS_x86_64_unknown_linux_musl="-idirafter /usr/include -idirafter /usr/include/x86_64-linux-gnu"`。
++不要把 glibc 标准头文件放到 musl 标准头文件之前。
++
++生产验证应使用 musl release，它包含 Firecracker 的默认 seccomp 策略；
++GNU/debug 构建默认空 seccomp，不能据此声称验证了生产隔离。
++
++本次 x86 MMIO/Linux 6.18.54 验证需 `acpi=off` 启动参数；否则 ACPI 初始化错误会使
++virtio-blk/virtio-fs probe 返回 EINVAL。此参数与依赖 ACPI 的功能不兼容。
++
++Debian 13 guest：
++
++```sh
++mkdir -p /workspace/project
++mount -t virtiofs -o rw,nodev,nosuid workspace /workspace/project
++```
++
++授权 Codex 目录的 VM 可以将相同 tag 挂载到 `/home/agent/.codex`；
++其 UID/GID、配置/session 内容、运行时固定入口由管理服务的 profile 定义。
++
++## 可重复验收
++
++```sh
++cargo test --locked -p vmm '::fs::' --lib
++cargo test --locked -p firecracker api_server::request::fs
++sudo python3 tools/virtiofs/smoke.py \
++  --firecracker /absolute/path/to/musl-release/firecracker \
++  --kernel /absolute/path/to/vmlinux \
++  --rootfs /absolute/path/to/debian13.ext4 \
++  --virtiofsd /absolute/path/to/virtiofsd \
++  --output /absolute/path/to/new-private-evidence-dir
++```
++
++脚本复制根盘，仅用 debugfs 注入测试脚本，不在宿主挂载 guest 文件系统。
++它通过真实 KVM/virtio-fs guest 验证 Debian 13、目录读写与 rename、符号链接读取及 rename 越界拒绝、
++guest rw 挂载下 daemon 只读拒绝 create/unlink/rename、启动后配置拒绝、快照拒绝、
++daemon 断开停止 VMM；finally 杀死/reap 测试进程，删除根盘副本并保留日志。
++该脚本直接运行 VMM，用于设备验收，**不代替管理服务的 jailer/cgroup/父进程死亡回收验收**。
++
++接口依据：[virtio-fs 规范](https://docs.oasis-open.org/virtio/virtio/v1.3/virtio-v1.3.html)、
++[Rust virtiofsd](https://gitlab.com/virtio-fs/virtiofsd/-/blob/main/README.md)。
++
++## 2026-10-24 本机验收记录
++
++基线为 Firecracker `edb60617c`，x86_64/KVM，Rust virtiofsd 1.14.0。
++最终内核为 Linux 6.18.54，基于现有 6.1 guest 配置启用 virtio-fs、MMIO cmdline 及
++`INPUT_KEYBOARD/KEYBOARD_ATKBD/SERIO/SERIO_I8042/SERIO_LIBPS2`，后者供
++管理服务的 systemd/CtrlAltDel 正常关机验收使用。设备测试自身通过 bash init 运行，
++不以该测试推断 systemd 正常关机、jailer 或 supervisor 集成已经完成。
++
++已通过：
++
++- `cargo clippy -p vmm -p firecracker --all-targets --locked -- -D warnings`。
++- `cargo test --locked -p vmm '::fs::' --lib`：3 项通过。
++- `cargo test --locked -p firecracker api_server::request::fs`：API 测试在 lib/bin 目标通过。
++- musl release + 默认 seccomp + Debian 13/udev 根盘，两组真实 guest 验收通过：
++  读写、目录及 session 文件 rename、宿主直接读到 guest 文件；绝对/相对符号链接读取
++  越界拒绝、目录符号链接 rename 越界拒绝；guest rw 挂载下 daemon 只读 create/unlink/rename
++  均拒绝；启动后配置拒绝；快照拒绝且未创建快照文件；daemon 断开导致 VMM 退出码 1。
++- shell/Python 脚本语法检查、`git diff --check`。
++
++最终证据目录为 `/home/li/share/prj/virtiofs-validation/final-keyboard/`，
++摘要为相邻 `final-keyboard.log`；每个 case 保留 `guest.log` 与 `daemon.log`。
++日志留在本地私有目录，不提交 guest 根盘或源目录数据。
++
++| 制品 | SHA-256 |
++| --- | --- |
++| musl release firecracker | `2e67c23d06a8320af90aa610a06b30fc57a2fb4191258c00494b9db94db68e27` |
++| Linux 6.18.54 vmlinux（含键盘） | `dbbdab9311284c3107c173abe685f576106e844d85d437879727dd8af45e7f34` |
++| Debian 13/udev 根盘 | `cf59924963000a5873136cbedc504552af3c8938363a0e1ba25e92ae9b2d8fe1` |
++| Linux 6.18.54 源码 tar.xz | `9df30b02dd8102bbd0be52556288ef6889ddbe7f1ddb96fbf847d0becf3eacac` |
++| 初始 guest-base.config | `6d09ac0e4ecfc14220aff063f3804cf5bd2d455cd3b41693f789b6243d2f4e3a` |
++
++生产 seccomp 验证实际发现 vCPU 激活的 `recvmsg` 缺失；本分支仅补充 `flags=0` 规则，
++不绕过 seccomp。aarch64 同步策略规则，但本次未运行 aarch64 guest。
+diff --git a/resources/seccomp/aarch64-unknown-linux-musl.json b/resources/seccomp/aarch64-unknown-linux-musl.json
+index faf26e2e2..54db61a09 100644
+--- a/resources/seccomp/aarch64-unknown-linux-musl.json
++++ b/resources/seccomp/aarch64-unknown-linux-musl.json
+@@ -1396,6 +1396,11 @@
+                 "syscall": "sendmsg",
+                 "comment": "Used by vhost-user frontend to communicate with the backend"
+             },
++            {
++                "syscall": "recvmsg",
++                "comment": "Receive vhost-user REPLY_ACK during virtio-fs activation",
++                "args": [{"index": 2, "type": "dword", "op": "eq", "val": 0}]
++            },
+             {
+                 "syscall": "restart_syscall",
+                 "comment": "automatically issued by the kernel when specific timing-related syscalls (e.g. nanosleep) get interrupted by SIGSTOP"
+diff --git a/resources/seccomp/x86_64-unknown-linux-musl.json b/resources/seccomp/x86_64-unknown-linux-musl.json
+index 8ecbc1cd9..267c817e9 100644
+--- a/resources/seccomp/x86_64-unknown-linux-musl.json
++++ b/resources/seccomp/x86_64-unknown-linux-musl.json
+@@ -1528,6 +1528,11 @@
+                 "syscall": "sendmsg",
+                 "comment": "Used by vhost-user frontend to communicate with the backend"
+             },
++            {
++                "syscall": "recvmsg",
++                "comment": "Receive vhost-user REPLY_ACK during virtio-fs activation",
++                "args": [{"index": 2, "type": "dword", "op": "eq", "val": 0}]
++            },
+             {
+                 "syscall": "restart_syscall",
+                 "comment": "automatically issued by the kernel when specific timing-related syscalls (e.g. nanosleep) get interrupted by SIGSTOP"
+diff --git a/src/firecracker/src/api_server/parsed_request.rs b/src/firecracker/src/api_server/parsed_request.rs
+index 2946b1970..84537f1a9 100644
+--- a/src/firecracker/src/api_server/parsed_request.rs
++++ b/src/firecracker/src/api_server/parsed_request.rs
+@@ -99,6 +99,9 @@ impl TryFrom<&Request> for ParsedRequest {
+             (Method::Put, "boot-source", Some(body)) => parse_put_boot_source(body),
+             (Method::Put, "cpu-config", Some(body)) => parse_put_cpu_config(body),
+             (Method::Put, "drives", Some(body)) => parse_put_drive(body, path_tokens.next()),
++            (Method::Put, "fs", Some(body)) => {
++                super::request::fs::parse_put_fs(body, path_tokens.next())
++            }
+             (Method::Put, "pmem", Some(body)) => parse_put_pmem(body, path_tokens.next()),
+             (Method::Put, "logger", Some(body)) => parse_put_logger(body),
+             (Method::Put, "serial", Some(body)) => parse_put_serial(body),
+diff --git a/src/firecracker/src/api_server/request/fs.rs b/src/firecracker/src/api_server/request/fs.rs
+new file mode 100644
+index 000000000..db4203f9b
+--- /dev/null
++++ b/src/firecracker/src/api_server/request/fs.rs
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: Apache-2.0
++use super::super::parsed_request::{ParsedRequest, RequestError, checked_id};
++use super::{Body, StatusCode};
++use vmm::rpc_interface::VmmAction;
++use vmm::vmm_config::fs::FsConfig;
++
++pub(crate) fn parse_put_fs(body: &Body, id: Option<&str>) -> Result<ParsedRequest, RequestError> {
++    let id = checked_id(id.ok_or(RequestError::EmptyID)?)?;
++    let config: FsConfig = serde_json::from_slice(body.raw())?;
++    if id != config.fs_id {
++        return Err(RequestError::Generic(
++            StatusCode::BadRequest,
++            "Path id must match fs_id".into(),
++        ));
++    }
++    config
++        .validate()
++        .map_err(|e| RequestError::Generic(StatusCode::BadRequest, e.to_string()))?;
++    Ok(ParsedRequest::new_sync(VmmAction::InsertFs(config)))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn test_put_fs_validates_id_tag_and_unknown_fields() {
++        let body = Body::new(r#"{"fs_id":"project","tag":"workspace","socket":"/fs.sock"}"#);
++        parse_put_fs(&body, Some("project")).unwrap();
++        parse_put_fs(&body, Some("other")).unwrap_err();
++        parse_put_fs(&body, None).unwrap_err();
++        parse_put_fs(
++            &Body::new(r#"{"fs_id":"p","tag":"../escape","socket":"/s"}"#),
++            Some("p"),
++        )
++        .unwrap_err();
++        parse_put_fs(
++            &Body::new(r#"{"fs_id":"p","tag":"p","socket":"/s","read_only":true}"#),
++            Some("p"),
++        )
++        .unwrap_err();
++    }
++}
+diff --git a/src/firecracker/src/api_server/request/mod.rs b/src/firecracker/src/api_server/request/mod.rs
+index 9be4617bd..91ba6ac08 100644
+--- a/src/firecracker/src/api_server/request/mod.rs
++++ b/src/firecracker/src/api_server/request/mod.rs
+@@ -7,6 +7,7 @@ pub mod boot_source;
+ pub mod cpu_configuration;
+ pub mod drive;
+ pub mod entropy;
++pub mod fs;
+ pub mod hotplug;
+ pub mod instance_info;
+ pub mod logger;
+diff --git a/src/firecracker/swagger/firecracker.yaml b/src/firecracker/swagger/firecracker.yaml
+index 00fa1ae53..30b48f7ba 100644
+--- a/src/firecracker/swagger/firecracker.yaml
++++ b/src/firecracker/swagger/firecracker.yaml
+@@ -339,6 +339,33 @@ paths:
+           schema:
+             $ref: "#/definitions/Error"
+ 
++  /fs/{fs_id}:
++    put:
++      summary: Configure a single virtio-fs export before boot.
++      description: Requires MMIO and fixed shared guest memory. No DAX, hotplug or snapshots. Directory authorization and read-only enforcement belong to the backend supervisor.
++      operationId: putGuestFsByID
++      parameters:
++        - name: fs_id
++          in: path
++          required: true
++          type: string
++        - name: body
++          in: body
++          required: true
++          schema:
++            $ref: "#/definitions/Fs"
++      responses:
++        204:
++          description: Configuration accepted; backend connection occurs at boot.
++        400:
++          description: Invalid configuration or operation after boot.
++          schema:
++            $ref: "#/definitions/Error"
++        default:
++          description: Internal server error.
++          schema:
++            $ref: "#/definitions/Error"
++
+   /pmem/{id}:
+     put:
+       summary: Creates or updates a pmem device. Pre-boot only.
+@@ -1302,6 +1329,24 @@ definitions:
+         type: integer
+         description: Suggested optimal (maximum) I/O size, in units of logical blocks.
+ 
++  Fs:
++    type: object
++    additionalProperties: false
++    required: [fs_id, tag, socket]
++    properties:
++      fs_id:
++        type: string
++        pattern: '^[a-zA-Z0-9_-]+$'
++      tag:
++        type: string
++        minLength: 1
++        maxLength: 36
++        pattern: '^[a-zA-Z0-9_-]+$'
++      socket:
++        type: string
++        minLength: 1
++        description: Trusted vhost-user socket path visible inside the VMM jail.
++
+   Pmem:
+     type: object
+     required:
+@@ -1365,6 +1410,11 @@ definitions:
+         description: Configurations for all net devices.
+         items:
+           $ref: "#/definitions/NetworkInterface"
++      fs:
++        type: array
++        maxItems: 1
++        items:
++          $ref: "#/definitions/Fs"
+       pmem:
+         type: array
+         description: Configurations for all pmem devices.
+diff --git a/src/vmm/src/builder.rs b/src/vmm/src/builder.rs
+index bcb0e027a..61bf47311 100644
+--- a/src/vmm/src/builder.rs
++++ b/src/vmm/src/builder.rs
+@@ -79,6 +79,8 @@ pub enum StartMicrovmError {
+     CreateNetDevice(crate::devices::virtio::net::NetError),
+     /// Cannot create pmem device: {0}
+     CreatePmemDevice(#[from] crate::devices::virtio::pmem::device::PmemError),
++    /// Cannot create virtio-fs device: {0}
++    CreateFsDevice(#[from] crate::vmm_config::fs::FsError),
+     /// Error creating legacy device: {0}
+     #[cfg(target_arch = "x86_64")]
+     CreateLegacyDevice(device_manager::legacy::LegacyDeviceError),
+@@ -249,6 +251,13 @@ pub fn build_microvm_for_boot(
+         vm_resources.net_builder.iter(),
+         event_manager,
+     )?;
++    attach_fs_devices(
++        &mut device_manager,
++        &vm,
++        &mut boot_cmdline,
++        vm_resources,
++        event_manager,
++    )?;
+     attach_pmem_devices(
+         &mut device_manager,
+         &vm,
+@@ -710,6 +719,40 @@ fn attach_net_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Net>>> + Debug>(
+     Ok(())
+ }
+ 
++fn attach_fs_devices(
++    manager: &mut DeviceManager,
++    vm: &Vm,
++    cmdline: &mut LoaderKernelCmdline,
++    resources: &VmResources,
++    events: &mut EventManager,
++) -> Result<(), StartMicrovmError> {
++    if !resources.fs.is_empty() && (resources.pci_enabled || resources.memory_hotplug.is_some()) {
++        return Err(crate::vmm_config::fs::FsError::Invalid(
++            "virtio-fs requires MMIO and fixed guest memory".into(),
++        )
++        .into());
++    }
++    for config in &resources.fs {
++        let fs = crate::devices::virtio::fs::Fs::new(
++            config.clone(),
++            vm.as_kvm()
++                .ok_or(AttachDeviceError::NotSupported)?
++                .vcpus_exit_evt()
++                .try_clone()
++                .map_err(crate::vmm_config::fs::FsError::EventFd)?,
++        )?;
++        manager.attach_boot_virtio_device(
++            vm,
++            config.fs_id.clone(),
++            Arc::new(Mutex::new(fs)),
++            cmdline,
++            events,
++            true,
++        )?;
++    }
++    Ok(())
++}
++
+ fn attach_pmem_devices(
+     device_manager: &mut DeviceManager,
+     vm: &Vm,
+diff --git a/src/vmm/src/device_manager/pci_mngr.rs b/src/vmm/src/device_manager/pci_mngr.rs
+index d97db4135..6b4aa7392 100644
+--- a/src/vmm/src/device_manager/pci_mngr.rs
++++ b/src/vmm/src/device_manager/pci_mngr.rs
+@@ -470,6 +470,9 @@ impl<'a> Persist<'a> for PciDevices {
+                         transport_state,
+                     });
+                 }
++                VirtioDeviceType::Fs => {
++                    unreachable!("virtio-fs snapshots are rejected before serialization")
++                }
+                 VirtioDeviceType::Mem => {
+                     let mem_dev = locked_virtio_dev
+                         .as_mut_any()
+diff --git a/src/vmm/src/device_manager/persist.rs b/src/vmm/src/device_manager/persist.rs
+index 82518eb6f..1de06115f 100644
+--- a/src/vmm/src/device_manager/persist.rs
++++ b/src/vmm/src/device_manager/persist.rs
+@@ -377,6 +377,9 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
+                         device_info,
+                     })
+                 }
++                VirtioDeviceType::Fs => {
++                    unreachable!("virtio-fs snapshots are rejected before serialization")
++                }
+                 VirtioDeviceType::Mem => {
+                     let mem = locked_device
+                         .as_mut_any()
+diff --git a/src/vmm/src/devices/virtio/device.rs b/src/vmm/src/devices/virtio/device.rs
+index 76103b48e..96d711612 100644
+--- a/src/vmm/src/devices/virtio/device.rs
++++ b/src/vmm/src/devices/virtio/device.rs
+@@ -62,6 +62,7 @@ impl DeviceState {
+ #[repr(u8)]
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+ pub enum VirtioDeviceType {
++    Fs = 26,
+     Net = virtio_ids::VIRTIO_ID_NET as u8,
+     Block = virtio_ids::VIRTIO_ID_BLOCK as u8,
+     Rng = virtio_ids::VIRTIO_ID_RNG as u8,
+@@ -81,6 +82,11 @@ pub type VirtioDeviceId = (VirtioDeviceType, String);
+ /// expose them to the transport via get_queues/get_queue_events/get_interrupt/get_interrupt_status
+ /// fns.
+ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
++    /// Whether an unrecoverable backend failure requested VM shutdown.
++    fn is_failed(&self) -> bool {
++        false
++    }
++
+     /// Get the available features offered by device.
+     fn avail_features(&self) -> u64;
+ 
+diff --git a/src/vmm/src/devices/virtio/fs.rs b/src/vmm/src/devices/virtio/fs.rs
+new file mode 100644
+index 000000000..a3dfc6b3c
+--- /dev/null
++++ b/src/vmm/src/devices/virtio/fs.rs
+@@ -0,0 +1,297 @@
++// SPDX-License-Identifier: Apache-2.0
++//! Minimal vhost-user virtio-fs frontend: one hiprio and one request queue, no DAX.
++use std::sync::Arc;
++use std::time::Instant;
++use vmm_sys_util::epoll::EventSet;
++
++use event_manager::{EventOps, Events, MutEventSubscriber};
++use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
++use vmm_sys_util::eventfd::EventFd;
++
++use super::ActivateError;
++use super::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
++use super::queue::Queue;
++use super::transport::VirtioInterrupt;
++use super::vhost_user::VhostUserHandle;
++use crate::impl_device_type;
++use crate::logger::{error, info};
++use crate::vmm_config::fs::{FsConfig, FsError};
++use crate::vstate::memory::GuestMemoryMmap;
++
++const PROTOCOL: u64 = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
++const VERSION_1: u64 = 1 << 32;
++
++/// File system requests are serviced by the external Rust virtiofsd process.
++#[derive(Debug)]
++pub struct Fs {
++    /// Validated boot configuration.
++    pub config: FsConfig,
++    handle: VhostUserHandle,
++    features: u64,
++    acked: u64,
++    bytes: [u8; 40],
++    queues: Vec<Queue>,
++    events: [EventFd; 2],
++    state: DeviceState,
++    exit_evt: EventFd,
++    failed: bool,
++}
++
++impl Fs {
++    /// Connect and negotiate the minimal supported backend features.
++    pub fn new(config: FsConfig, exit_evt: EventFd) -> Result<Self, FsError> {
++        config.validate()?;
++        let start = Instant::now();
++        let mut handle = VhostUserHandle::new(&config.socket, 2).inspect_err(|err| {
++            error!(
++                "virtio-fs id={} stage=connect result=error elapsed_us={} cause={err}",
++                config.fs_id,
++                start.elapsed().as_micros()
++            );
++        })?;
++        let (features, _) = handle.negotiate_features(
++            VERSION_1 | PROTOCOL | (1 << 28) | (1 << 29),
++            VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::REPLY_ACK,
++        )?;
++        if features & (VERSION_1 | PROTOCOL) != VERSION_1 | PROTOCOL {
++            return Err(FsError::Invalid(
++                "backend requires VERSION_1 and PROTOCOL_FEATURES".into(),
++            ));
++        }
++        let mut bytes = [0; 40];
++        bytes[..config.tag.len()].copy_from_slice(config.tag.as_bytes());
++        bytes[36..].copy_from_slice(&1u32.to_le_bytes());
++        info!(
++            "virtio-fs id={} stage=connect result=ok elapsed_us={}",
++            config.fs_id,
++            start.elapsed().as_micros()
++        );
++        Ok(Self {
++            config,
++            handle,
++            features: features & !PROTOCOL,
++            acked: 0,
++            bytes,
++            queues: vec![Queue::new(256), Queue::new(256)],
++            events: [
++                EventFd::new(libc::EFD_NONBLOCK)?,
++                EventFd::new(libc::EFD_NONBLOCK)?,
++            ],
++            state: DeviceState::Inactive,
++            exit_evt,
++            failed: false,
++        })
++    }
++}
++
++impl MutEventSubscriber for Fs {
++    fn process(&mut self, event: Events, ops: &mut EventOps) {
++        if event
++            .event_set()
++            .intersects(EventSet::HANG_UP | EventSet::READ_HANG_UP | EventSet::ERROR)
++        {
++            error!(
++                "virtio-fs id={} stage=backend result=error category=disconnected action=stop_vm",
++                self.id()
++            );
++            let _ = ops.remove(Events::new(&self.handle.vu, EventSet::READ_HANG_UP));
++            self.failed = true;
++            self.exit_evt.write(1).expect("cannot signal VM shutdown");
++        }
++    }
++    fn init(&mut self, ops: &mut EventOps) {
++        if let Err(err) = ops.add(Events::new(&self.handle.vu, EventSet::READ_HANG_UP)) {
++            error!(
++                "virtio-fs id={} stage=monitor result=error cause={err} action=stop_vm",
++                self.id()
++            );
++            self.failed = true;
++            self.exit_evt.write(1).expect("cannot signal VM shutdown");
++        }
++    }
++}
++
++impl VirtioDevice for Fs {
++    impl_device_type!(VirtioDeviceType::Fs);
++    fn id(&self) -> &str {
++        &self.config.fs_id
++    }
++    fn avail_features(&self) -> u64 {
++        self.features
++    }
++    fn acked_features(&self) -> u64 {
++        self.acked
++    }
++    fn set_acked_features(&mut self, value: u64) {
++        self.acked = value;
++    }
++    fn queues(&self) -> &[Queue] {
++        &self.queues
++    }
++    fn queues_mut(&mut self) -> &mut [Queue] {
++        &mut self.queues
++    }
++    fn queue_events(&self) -> &[EventFd] {
++        &self.events
++    }
++    fn interrupt_trigger(&self) -> &dyn VirtioInterrupt {
++        self.state
++            .active_state()
++            .expect("inactive virtio-fs")
++            .interrupt
++            .as_ref()
++    }
++    fn config_as_bytes(&self) -> &[u8] {
++        &self.bytes
++    }
++    fn write_config(&mut self, _: u64, _: &[u8]) {}
++    fn activate(
++        &mut self,
++        mem: GuestMemoryMmap,
++        interrupt: Arc<dyn VirtioInterrupt>,
++    ) -> Result<(), ActivateError> {
++        let start = Instant::now();
++        for queue in &mut self.queues {
++            queue
++                .initialize(&mem)
++                .map_err(ActivateError::QueueMemoryError)?;
++        }
++        self.handle
++            .set_features(self.acked | PROTOCOL)
++            .and_then(|()| {
++                self.handle.setup_backend(
++                    &mem,
++                    &[
++                        (0, &self.queues[0], &self.events[0]),
++                        (1, &self.queues[1], &self.events[1]),
++                    ],
++                    interrupt.clone(),
++                )
++            })
++            .map_err(|err| {
++                error!(
++                    "virtio-fs id={} stage=activate result=error elapsed_us={} cause={err}",
++                    self.id(),
++                    start.elapsed().as_micros()
++                );
++                ActivateError::VhostUser(err)
++            })?;
++        self.state = DeviceState::Activated(ActiveState { mem, interrupt });
++        info!(
++            "virtio-fs id={} stage=activate result=ok elapsed_us={}",
++            self.id(),
++            start.elapsed().as_micros()
++        );
++        Ok(())
++    }
++    fn is_failed(&self) -> bool {
++        self.failed
++    }
++    fn is_activated(&self) -> bool {
++        self.state.is_activated()
++    }
++    fn deactivate(&mut self) {
++        self.state = DeviceState::Inactive;
++    }
++    fn _reset(&mut self) -> bool {
++        false
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::io::{Read, Write};
++    use std::os::unix::net::UnixListener;
++    use std::thread;
++
++    use super::*;
++    use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt};
++    use crate::devices::virtio::vhost_user::tests::create_mem;
++    use crate::vstate::memory::GuestAddress;
++    use vmm_sys_util::tempdir::TempDir;
++    use vmm_sys_util::tempfile::TempFile;
++
++    type BackendCalls = thread::JoinHandle<Vec<(u32, Vec<u8>)>>;
++
++    fn mock_backend(listener: UnixListener, features: u64) -> BackendCalls {
++        thread::spawn(move || {
++            let (mut stream, _) = listener.accept().unwrap();
++            let mut calls = Vec::new();
++            loop {
++                let mut header = [0u8; 12];
++                if stream.read_exact(&mut header).is_err() {
++                    break;
++                }
++                let request = u32::from_le_bytes(header[..4].try_into().unwrap());
++                let flags = u32::from_le_bytes(header[4..8].try_into().unwrap());
++                let size = u32::from_le_bytes(header[8..].try_into().unwrap());
++                let mut payload = vec![0; size as usize];
++                stream.read_exact(&mut payload).unwrap();
++                calls.push((request, payload));
++                let reply = match request {
++                    1 => Some(features),
++                    15 => Some(
++                        (VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::REPLY_ACK)
++                            .bits(),
++                    ),
++                    _ if flags & 8 != 0 => Some(0),
++                    _ => None,
++                };
++                if let Some(value) = reply {
++                    header[4..8].copy_from_slice(&5u32.to_le_bytes());
++                    header[8..].copy_from_slice(&8u32.to_le_bytes());
++                    stream.write_all(&header).unwrap();
++                    stream.write_all(&value.to_le_bytes()).unwrap();
++                }
++            }
++            calls
++        })
++    }
++
++    fn backend(features: u64) -> (TempDir, FsConfig, BackendCalls) {
++        let dir = TempDir::new().unwrap();
++        let path = dir.as_path().join("fs.sock");
++        let listener = UnixListener::bind(&path).unwrap();
++        let config = FsConfig {
++            fs_id: "project".into(),
++            tag: "workspace".into(),
++            socket: path.to_str().unwrap().into(),
++        };
++        (dir, config, mock_backend(listener, features))
++    }
++
++    #[test]
++    fn test_fs_activation_config_and_two_queues() {
++        let (_dir, config, backend) = backend(VERSION_1 | PROTOCOL | (1 << 28) | (1 << 29));
++        let mut fs = Fs::new(config, EventFd::new(libc::EFD_NONBLOCK).unwrap()).unwrap();
++        assert_eq!(fs.device_type(), VirtioDeviceType::Fs);
++        assert_eq!(&fs.bytes[..9], b"workspace");
++        assert_eq!(&fs.bytes[36..], &1u32.to_le_bytes());
++        assert_eq!(fs.avail_features() & PROTOCOL, 0);
++        assert_eq!(fs.queues().len(), 2);
++        let file = TempFile::new().unwrap().into_file();
++        file.set_len(0x10000).unwrap();
++        let mem = create_mem(file, &[(GuestAddress(0), 0x10000)]);
++        fs.queues[0] = VirtQueue::new(GuestAddress(0), &mem, 16).create_queue();
++        fs.queues[1] = VirtQueue::new(GuestAddress(0x4000), &mem, 16).create_queue();
++        fs.set_acked_features(fs.avail_features());
++        fs.activate(mem, default_interrupt()).unwrap();
++        assert!(fs.is_activated());
++        drop(fs);
++        let calls = backend.join().unwrap();
++        assert_eq!(calls.iter().filter(|(req, _)| *req == 5).count(), 1); // Memory table.
++        let enabled: Vec<_> = calls
++            .iter()
++            .filter(|(req, _)| *req == 18)
++            .map(|(_, body)| u32::from_le_bytes(body[..4].try_into().unwrap()))
++            .collect();
++        assert_eq!(enabled, vec![0, 1]);
++    }
++
++    #[test]
++    fn test_fs_reject_legacy_backend() {
++        let (_dir, config, backend) = backend(0);
++        Fs::new(config, EventFd::new(0).unwrap()).unwrap_err();
++        backend.join().unwrap();
++    }
++}
+diff --git a/src/vmm/src/devices/virtio/mod.rs b/src/vmm/src/devices/virtio/mod.rs
+index ec9536870..5e5059f65 100644
+--- a/src/vmm/src/devices/virtio/mod.rs
++++ b/src/vmm/src/devices/virtio/mod.rs
+@@ -15,6 +15,7 @@ use crate::devices::virtio::net::TapError;
+ pub mod balloon;
+ pub mod block;
+ pub mod device;
++pub mod fs;
+ pub mod generated;
+ mod iov_deque;
+ pub mod iovec;
+diff --git a/src/vmm/src/lib.rs b/src/vmm/src/lib.rs
+index 4cab4c79d..2ef989b48 100644
+--- a/src/vmm/src/lib.rs
++++ b/src/vmm/src/lib.rs
+@@ -348,6 +348,7 @@ impl Vmm {
+         let mut net = Vec::new();
+         let mut net_with_mmds = Vec::new();
+         let mut pmem = Vec::new();
++        let mut fs = Vec::new();
+         let mut balloon = None;
+         let mut vsock = None;
+         let mut entropy = None;
+@@ -374,6 +375,14 @@ impl Vmm {
+                         }
+                     }
+                 }
++                VirtioDeviceType::Fs => {
++                    if let Some(f) = device
++                        .as_any()
++                        .downcast_ref::<crate::devices::virtio::fs::Fs>()
++                    {
++                        fs.push(f.config.clone());
++                    }
++                }
+                 VirtioDeviceType::Pmem => {
+                     if let Some(p) = device.as_any().downcast_ref::<Pmem>() {
+                         pmem.push(p.config.clone());
+@@ -427,6 +436,7 @@ impl Vmm {
+             vsock,
+             entropy,
+             pmem_devices: pmem,
++            fs,
+             // serial_config is marked serde(skip) so that it doesnt end up in snapshots
+             serial_config: None,
+             memory_hotplug,
+@@ -438,6 +448,9 @@ impl Vmm {
+         let mut tuples = Vec::new();
+         self.device_manager
+             .for_each_virtio_device(|device_type, device| {
++                if device_type == VirtioDeviceType::Fs {
++                    tuples.push(("virtio-fs", device.id().to_owned()));
++                }
+                 if let VirtioDeviceType::Block = device_type
+                     && let Some(b) = device.as_any().downcast_ref::<Block>()
+                     && b.is_vhost_user()
+@@ -820,7 +833,14 @@ impl MutEventSubscriber for Vmm {
+                             }
+                         }
+ 
+-                        // No CPUs exited with error status code, report "Ok"
++                        let mut device_failed = false;
++                        self.device_manager.for_each_virtio_device(|_, device| {
++                            device_failed |= device.is_failed();
++                        });
++                        if device_failed {
++                            break 'exit_code FcExitCode::GenericError;
++                        }
++                        // No CPUs or devices exited with error status code, report "Ok"
+                         FcExitCode::Ok
+                     };
+                     self.stop(exit_code);
+diff --git a/src/vmm/src/resources.rs b/src/vmm/src/resources.rs
+index 28bb63c60..8ba0ed5c0 100644
+--- a/src/vmm/src/resources.rs
++++ b/src/vmm/src/resources.rs
+@@ -23,6 +23,7 @@ use crate::vmm_config::boot_source::{
+ };
+ use crate::vmm_config::drive::*;
+ use crate::vmm_config::entropy::*;
++use crate::vmm_config::fs::{FsConfig, FsError};
+ use crate::vmm_config::instance_info::InstanceInfo;
+ use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
+ use crate::vmm_config::memory_hotplug::{MemoryHotplugConfig, MemoryHotplugConfigError};
+@@ -66,6 +67,8 @@ pub enum ResourcesError {
+     EntropyConfig(#[from] EntropyDeviceError),
+     /// Pmem device error: {0}
+     PmemConfig(#[from] PmemConfigError),
++    /// File system device error: {0}
++    Fs(#[from] FsError),
+     /// Memory hotplug config error: {0}
+     MemoryHotplugConfig(#[from] MemoryHotplugConfigError),
+ }
+@@ -97,6 +100,8 @@ pub struct VmmConfig {
+     pub entropy: Option<EntropyDeviceConfig>,
+     #[serde(default, rename = "pmem")]
+     pub pmem_devices: Vec<PmemConfig>,
++    #[serde(default, skip_serializing_if = "Vec::is_empty")]
++    pub fs: Vec<FsConfig>,
+     #[serde(skip)]
+     pub serial_config: Option<SerialConfig>,
+     pub memory_hotplug: Option<MemoryHotplugConfig>,
+@@ -122,6 +127,8 @@ pub struct VmResources {
+     pub entropy: EntropyDeviceBuilder,
+     /// The pmem device configs.
+     pub pmem: PmemBuilder,
++    /// Single-directory file system configuration.
++    pub fs: Vec<FsConfig>,
+     /// The memory hotplug configuration.
+     pub memory_hotplug: Option<MemoryHotplugConfig>,
+     /// The optional Mmds data store.
+@@ -228,6 +235,9 @@ impl VmResources {
+             resources.build_entropy_device(entropy_device_config)?;
+         }
+ 
++        for config in vmm_config.fs {
++            resources.set_fs(config)?;
++        }
+         for pmem_config in vmm_config.pmem_devices.into_iter() {
+             resources.build_pmem_device(pmem_config)?;
+         }
+@@ -390,6 +400,18 @@ impl VmResources {
+         self.entropy.insert(body)
+     }
+ 
++    /// Configure one file system export before boot.
++    pub fn set_fs(&mut self, config: FsConfig) -> Result<(), FsError> {
++        config.validate()?;
++        if !self.fs.is_empty() && self.fs[0].fs_id != config.fs_id {
++            return Err(FsError::Invalid(
++                "only one virtio-fs export is supported".into(),
++            ));
++        }
++        self.fs = vec![config];
++        Ok(())
++    }
++
+     /// Builds a pmem device to be attached when the VM starts.
+     pub fn build_pmem_device(&mut self, body: PmemConfig) -> Result<(), PmemConfigError> {
+         let has_block_root = self.block.has_root_device();
+@@ -481,7 +503,7 @@ impl VmResources {
+ 
+     /// Allocates the given guest memory regions.
+     ///
+-    /// If vhost-user-blk devices are in use, allocates memfd-backed shared memory, otherwise
++    /// If vhost-user-blk or virtio-fs devices are in use, allocates shared memfd memory, otherwise
+     /// prefers anonymous memory for performance reasons.
+     fn allocate_memory_regions(
+         &self,
+@@ -495,14 +517,14 @@ impl VmResources {
+ 
+         // Page faults are more expensive for shared memory mapping, including  memfd.
+         // For this reason, we only back guest memory with a memfd
+-        // if a vhost-user-blk device is configured in the VM, otherwise we fall back to
++        // if a vhost-user-blk or virtio-fs device is configured, otherwise we fall back to
+         // an anonymous private memory.
+         //
+         // The vhost-user-blk branch is not currently covered by integration tests in Rust,
+         // because that would require running a backend process. If in the future we converge to
+         // a single way of backing guest memory for vhost-user and non-vhost-user cases,
+         // that would not be worth the effort.
+-        if vhost_user_device_used {
++        if vhost_user_device_used || !self.fs.is_empty() {
+             memory::memfd_backed(
+                 regions,
+                 self.machine_config.track_dirty_pages,
+@@ -552,6 +574,7 @@ impl From<&VmResources> for VmmConfig {
+             vsock: resources.vsock.config(),
+             entropy: resources.entropy.config(),
+             pmem_devices: resources.pmem.configs.clone(),
++            fs: resources.fs.clone(),
+             // serial_config is marked serde(skip) so that it doesnt end up in snapshots.
+             serial_config: None,
+             memory_hotplug: resources.memory_hotplug.clone(),
+@@ -667,6 +690,7 @@ mod tests {
+             mmds_size_limit: HTTP_MAX_PAYLOAD_SIZE,
+             entropy: Default::default(),
+             pmem: Default::default(),
++            fs: Default::default(),
+             pci_enabled: false,
+             serial_out_path: None,
+             serial_rate_limiter_cfg: None,
+diff --git a/src/vmm/src/rpc_interface.rs b/src/vmm/src/rpc_interface.rs
+index ef6fd1d49..3941f3bb5 100644
+--- a/src/vmm/src/rpc_interface.rs
++++ b/src/vmm/src/rpc_interface.rs
+@@ -86,6 +86,8 @@ pub enum VmmAction {
+     InsertBlockDevice(BlockDeviceConfig),
+     /// Add a virtio-pmem device.
+     InsertPmemDevice(PmemConfig),
++    /// Configure a preboot virtio-fs export.
++    InsertFs(crate::vmm_config::fs::FsConfig),
+     /// Update an existing pmem device's rate limiter.
+     UpdatePmemDevice(PmemDeviceUpdateConfig),
+     /// Add a new network interface config or update one that already exists using the
+@@ -177,6 +179,8 @@ pub enum VmmActionError {
+     EntropyConfig(#[from] EntropyDeviceError),
+     /// Pmem config error: {0}
+     PmemConfig(#[from] PmemConfigError),
++    /// File system configuration: {0}
++    Fs(#[from] crate::vmm_config::fs::FsError),
+     /// Memory hotplug config error: {0}
+     MemoryHotplugConfig(#[from] MemoryHotplugConfigError),
+     /// Memory hotplug update error: {0}
+@@ -476,6 +480,11 @@ impl<'a> PrebootApiController<'a> {
+             GetVmmVersion => Ok(VmmData::VmmVersion(self.instance_info.vmm_version.clone())),
+             InsertBlockDevice(config) => self.insert_block_device(config),
+             InsertPmemDevice(config) => self.insert_pmem_device(config),
++            InsertFs(config) => {
++                self.boot_path = true;
++                self.vm_resources.set_fs(config)?;
++                Ok(VmmData::Empty)
++            }
+             InsertNetworkDevice(config) => self.insert_net_device(config),
+             LoadSnapshot(config) => self
+                 .load_snapshot(&config)
+@@ -847,6 +856,7 @@ impl RuntimeApiController {
+                 .update_memory_hotplug_size(cfg.requested_size_mib)
+                 .map(|_| VmmData::Empty)
+                 .map_err(VmmActionError::MemoryHotplugUpdate),
++            InsertFs(_) => Err(VmmActionError::OperationNotSupportedPostBoot),
+             // Operations not allowed post-boot.
+             ConfigureBootSource(_)
+             | ConfigureLogger(_)
+diff --git a/src/vmm/src/vmm_config/fs.rs b/src/vmm/src/vmm_config/fs.rs
+new file mode 100644
+index 000000000..bc7be55ce
+--- /dev/null
++++ b/src/vmm/src/vmm_config/fs.rs
+@@ -0,0 +1,82 @@
++// SPDX-License-Identifier: Apache-2.0
++//! Configuration for a single-directory, non-DAX virtio-fs export.
++use serde::{Deserialize, Serialize};
++
++/// A trusted vhost-user socket; directory authorization belongs to its supervisor.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct FsConfig {
++    /// Device identifier.
++    pub fs_id: String,
++    /// Guest mount tag, at most 36 ASCII bytes.
++    pub tag: String,
++    /// Unix socket visible inside the VMM jail.
++    pub socket: String,
++}
++
++/// Configuration or backend initialization failure.
++#[derive(Debug, thiserror::Error, displaydoc::Display)]
++pub enum FsError {
++    /// Invalid virtio-fs configuration: {0}
++    Invalid(String),
++    /// virtio-fs backend: {0}
++    Backend(#[from] crate::devices::virtio::vhost_user::VhostUserError),
++    /// virtio-fs eventfd: {0}
++    EventFd(#[from] std::io::Error),
++}
++
++impl FsConfig {
++    /// Validate before connecting to any backend.
++    pub fn validate(&self) -> Result<(), FsError> {
++        let safe = |s: &str| {
++            !s.is_empty()
++                && s.bytes()
++                    .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
++        };
++        if !safe(&self.fs_id) || !safe(&self.tag) || self.tag.len() > 36 {
++            return Err(FsError::Invalid("id and tag must be nonempty ASCII alphanumeric, '_' or '-'; tag maximum is 36 bytes".into()));
++        }
++        if self.socket.is_empty() || self.socket.as_bytes().contains(&0) {
++            return Err(FsError::Invalid(
++                "socket must be a nonempty Unix socket path".into(),
++            ));
++        }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::resources::VmResources;
++
++    #[test]
++    fn test_fs_config_validation_and_single_export() {
++        let config = FsConfig {
++            fs_id: "project".into(),
++            tag: "workspace".into(),
++            socket: "/fs.sock".into(),
++        };
++        let mut resources = VmResources::default();
++        resources.set_fs(config.clone()).unwrap();
++        resources.set_fs(config.clone()).unwrap();
++        assert_eq!(resources.fs.len(), 1);
++        let mut invalid = config.clone();
++        invalid.fs_id = "other".into();
++        resources.set_fs(invalid).unwrap_err();
++        for tag in [
++            "".into(),
++            "a".repeat(37),
++            "has space".into(),
++            "../escape".into(),
++            "nul\0".into(),
++        ] {
++            let mut invalid = config.clone();
++            invalid.tag = tag;
++            invalid.validate().unwrap_err();
++        }
++        let mut max = config;
++        max.tag = "a".repeat(36);
++        max.validate().unwrap();
++    }
++}
+diff --git a/src/vmm/src/vmm_config/mod.rs b/src/vmm/src/vmm_config/mod.rs
+index 6a861375b..8d5af1b16 100644
+--- a/src/vmm/src/vmm_config/mod.rs
++++ b/src/vmm/src/vmm_config/mod.rs
+@@ -17,6 +17,7 @@ pub mod boot_source;
+ pub mod drive;
+ /// Wrapper for configuring the entropy device attached to the microVM.
+ pub mod entropy;
++pub mod fs;
+ /// Wrapper over the microVM general information attached to the microVM.
+ pub mod instance_info;
+ /// Wrapper for configuring the memory and CPU of the microVM.
+diff --git a/tools/virtiofs/build-kernel.sh b/tools/virtiofs/build-kernel.sh
+new file mode 100755
+index 000000000..34a51c96f
+--- /dev/null
++++ b/tools/virtiofs/build-kernel.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++# Build in a fresh output directory; never alter an existing kernel worktree.
++set -euo pipefail
++if [[ $# != 3 ]]; then
++  echo "Usage: $0 LINUX_SOURCE BASE_CONFIG OUTPUT_DIR" >&2
++  exit 2
++fi
++source_dir=$(realpath "$1")
++base_config=$(realpath "$2")
++output_dir=$(realpath -m "$3")
++mkdir -p "$output_dir"
++[[ ! -e "$output_dir/.config" ]] || { echo 'Output already configured' >&2; exit 1; }
++cp "$base_config" "$output_dir/.config"
++"$source_dir/scripts/config" --file "$output_dir/.config" \
++  -e FUSE_FS -e VIRTIO_FS -e VIRTIO_MMIO -e VIRTIO_MMIO_CMDLINE_DEVICES \
++  -e VIRTIO_BLK -e EXT4_FS -e DEVTMPFS -e DEVTMPFS_MOUNT \
++  -e INPUT -e INPUT_KEYBOARD -e KEYBOARD_ATKBD -e SERIO -e SERIO_I8042 -e SERIO_LIBPS2
++make -C "$source_dir" O="$output_dir" olddefconfig
++make -C "$source_dir" O="$output_dir" -j"${JOBS:-8}" vmlinux
+diff --git a/tools/virtiofs/smoke.py b/tools/virtiofs/smoke.py
+new file mode 100755
+index 000000000..10d0856cd
+--- /dev/null
++++ b/tools/virtiofs/smoke.py
+@@ -0,0 +1,178 @@
++#!/usr/bin/env python3
++"""Root-only, real KVM/Debian smoke test using private disposable artifacts.
++
++Does not mount a guest filesystem on the host. The supplied rootfs is copied.
++Runs the device directly; production jailer/supervisor acceptance is separate.
++"""
++import argparse
++import http.client
++import json
++import os
++from pathlib import Path
++import signal
++import socket
++import subprocess
++import time
++
++
++class UnixHTTP(http.client.HTTPConnection):
++    def connect(self):
++        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++        self.sock.settimeout(self.timeout)
++        self.sock.connect(self.host)
++
++
++def request(api, method, path, data, expected=204):
++    connection = UnixHTTP(str(api), timeout=10)
++    connection.request(method, path, json.dumps(data), {"Content-Type": "application/json"})
++    response = connection.getresponse()
++    body = response.read().decode()
++    connection.close()
++    assert response.status == expected, (path, response.status, body)
++    return body
++
++
++def wait_for(predicate, process, timeout=60):
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        if predicate():
++            return
++        assert process.poll() is None, f"Process exited: {process.returncode}"
++        time.sleep(0.1)
++    raise TimeoutError("guest/backend readiness timed out")
++
++
++def stop(process):
++    if process is None:
++        return
++    try:
++        os.killpg(process.pid, signal.SIGTERM)
++    except ProcessLookupError:
++        pass
++    try:
++        process.wait(timeout=5)
++    except subprocess.TimeoutExpired:
++        os.killpg(process.pid, signal.SIGKILL)
++        process.wait(timeout=5)
++
++
++def guest_script(readonly):
++    operation = '''
++if touch /share/forbidden; then echo READONLY_BYPASS; exit 1; fi
++if rm /share/from-host; then echo READONLY_UNLINK_BYPASS; exit 1; fi
++if mv /share/from-host /share/renamed; then echo READONLY_RENAME_BYPASS; exit 1; fi
++''' if readonly else '''
++mkdir /share/session
++printf guest-session > /share/session/record
++mv /share/session/record /share/session/renamed
++printf rename-probe > /share/movable
++if mv /share/movable /share/escape-dir/stolen; then echo RENAME_ESCAPE; exit 1; fi
++[ -f /share/movable ]
++ln -s ../from-host /share/session/link
++[ "$(cat /share/session/link)" = host-data ]
++'''
++    return '''#!/bin/bash
++set -eu
++mount -t proc proc /proc
++mount -t sysfs sysfs /sys
++mount -t devtmpfs devtmpfs /dev || true
++. /etc/os-release
++[ "$VERSION_ID" = 13 ]
++mkdir -p /share
++mount -t virtiofs -o rw,nodev,nosuid workspace /share
++[ "$(cat /share/from-host)" = host-data ]
++if cat /share/absolute-escape; then echo ABSOLUTE_ESCAPE; exit 1; fi
++if cat /share/relative-escape; then echo RELATIVE_ESCAPE; exit 1; fi
++''' + operation + '''
++sync
++echo VIRTIOFS_GUEST_PASS
++while :; do sleep 60; done
++'''
++
++
++def run_case(args, root, readonly):
++    case = root / ("readonly" if readonly else "readwrite")
++    case.mkdir()
++    share = case / "share"
++    share.mkdir()
++    (share / "from-host").write_text("host-data")
++    secret = case / "outside-secret"
++    secret.write_text("host-private")
++    (share / "absolute-escape").symlink_to(secret)
++    (share / "relative-escape").symlink_to("../outside-secret")
++    outside_dir = case / "outside-dir"
++    outside_dir.mkdir()
++    (share / "escape-dir").symlink_to(outside_dir)
++    disk = case / "root.ext4"
++    subprocess.run(["cp", "--reflink=auto", args.rootfs, disk], check=True)
++    script = case / "guest.sh"
++    script.write_text(guest_script(readonly))
++    subprocess.run(["debugfs", "-w", "-R", f"write {script} /virtiofs-test.sh", disk], check=True, capture_output=True)
++    daemon = vmm = None
++    api, backend = case / "api.sock", case / "fs.sock"
++    log = case / "guest.log"
++    try:
++        with (case / "daemon.log").open("wb") as output:
++            command = [args.virtiofsd, "--socket-path", str(backend), "--shared-dir", str(share),
++                       "--sandbox", "namespace", "--seccomp", "kill", "--cache", "never",
++                       "--inode-file-handles=never"]
++            if readonly:
++                command.append("--readonly")
++            daemon = subprocess.Popen(command, stdout=output, stderr=output, start_new_session=True)
++        wait_for(backend.exists, daemon)
++        with log.open("wb") as output:
++            vmm = subprocess.Popen([args.firecracker, "--api-sock", str(api)],
++                                   stdin=subprocess.PIPE, stdout=output, stderr=output, start_new_session=True)
++        wait_for(api.exists, vmm)
++        request(api, "PUT", "/machine-config", {"vcpu_count": 2, "mem_size_mib": 512})
++        request(api, "PUT", "/boot-source", {"kernel_image_path": args.kernel,
++                "boot_args": "console=ttyS0 reboot=k panic=1 pci=off acpi=off root=/dev/vda rw init=/bin/bash"})
++        request(api, "PUT", "/drives/root", {"drive_id": "root", "path_on_host": str(disk),
++                "is_root_device": True, "is_read_only": False})
++        fs = {"fs_id": "project", "tag": "workspace", "socket": str(backend)}
++        request(api, "PUT", "/fs/project", fs)
++        request(api, "PUT", "/actions", {"action_type": "InstanceStart"})
++        wait_for(lambda: "bash" in log.read_text(errors="replace") and "# " in log.read_text(errors="replace"), vmm)
++        vmm.stdin.write(b"exec /bin/bash /virtiofs-test.sh\n")
++        vmm.stdin.flush()
++        wait_for(lambda: "VIRTIOFS_GUEST_PASS" in log.read_text(errors="replace"), vmm)
++        request(api, "PUT", "/fs/project", fs, 400)
++        request(api, "PATCH", "/vm", {"state": "Paused"})
++        result = request(api, "PUT", "/snapshot/create", {"snapshot_type": "Full",
++                         "snapshot_path": str(case / "snapshot"), "mem_file_path": str(case / "memory")}, 400)
++        assert "virtio-fs" in result
++        assert not (case / "snapshot").exists()
++        request(api, "PATCH", "/vm", {"state": "Resumed"})
++        assert secret.read_text() == "host-private"
++        assert not list(outside_dir.iterdir())
++        if readonly:
++            assert not (share / "forbidden").exists()
++            assert (share / "from-host").read_text() == "host-data"
++        else:
++            assert (share / "session/renamed").read_text() == "guest-session"
++        stop(daemon)
++        daemon = None
++        assert vmm.wait(timeout=10) == 1, "backend failure must produce a nonzero VMM exit"
++        assert "category=disconnected" in log.read_text(errors="replace")
++        print(json.dumps({"case": case.name, "guest": "Debian 13", "result": "passed",
++                          "snapshot": "rejected", "daemon_disconnect": "vmm_stopped"}), flush=True)
++    finally:
++        stop(vmm)
++        stop(daemon)
++        disk.unlink(missing_ok=True)
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    for name in ["firecracker", "kernel", "rootfs", "virtiofsd", "output"]:
++        parser.add_argument("--" + name, required=True)
++    args = parser.parse_args()
++    assert os.geteuid() == 0, "Requires root for daemon namespaces and KVM"
++    root = Path(args.output).resolve()
++    root.mkdir(mode=0o700)
++    for readonly in [False, True]:
++        run_case(args, root, readonly)
++
++
++if __name__ == "__main__":
++    main()
