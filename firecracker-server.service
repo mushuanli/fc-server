@@ -6,6 +6,7 @@ After=network.target
 Type=simple
 EnvironmentFile=/etc/mindos-firecracker/environment
 ExecStart=/usr/local/bin/firecracker-server serve /etc/mindos-firecracker/config.toml
+ExecStopPost=/usr/local/libexec/mindos-firecracker/publish-ports.py reset
 KillMode=control-group
 TimeoutStopSec=120
 UMask=0077

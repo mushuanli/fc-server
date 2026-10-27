@@ -1,0 +1,11 @@
+{
+  "name": "mindos-guest-runtimes",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned guest tools; npm stays in the build stage",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.209",
+    "@deepseek-ai/dsh": "0.2.0-rc.2",
+    "@openai/codex": "0.164.0"
+  }
+}

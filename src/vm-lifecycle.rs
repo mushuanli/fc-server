@@ -78,6 +78,7 @@ impl VmLauncher {
 }
 
 pub async fn stop(config: &Config, id: &str, vm: &mut Vm) -> Result<&'static str, Error> {
+    crate::publication::clear(config, vm).await?;
     vm.stop.cancel();
     let mode = stop_vm(config, id, vm).await?;
     if let Some(backend) = &mut vm.backend {

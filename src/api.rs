@@ -2,6 +2,7 @@ use crate::{
     error::Error,
     launcher,
     manager::{self, mutation, CreateVm, Shared},
+    publication::{self, Protocol, Specification},
     resource_operations, transport,
     volume::{self, Volume},
 };
@@ -15,7 +16,7 @@ use axum::{
     Json, Router,
 };
 use futures_util::StreamExt;
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
@@ -39,6 +40,8 @@ pub fn router(manager: Shared, key: &str) -> Router {
         .route("/v1/profiles", get(profiles))
         .route("/v1/vms", get(list).post(create))
         .route("/v1/vms/:id", get(inspect).delete(stop))
+        .route("/v1/vms/:id/ports", get(published_ports).post(publish_port))
+        .route("/v1/vms/:id/ports/:protocol/:port", axum::routing::delete(unpublish_port))
         .route("/v1/vms/:id/connect/:port", post(connect))
         .route("/v1/volumes", get(volumes).post(create_volume))
         .route("/v1/volumes/:id", axum::routing::delete(delete_volume))
@@ -113,6 +116,31 @@ async fn stop(
 ) -> Result<Json<manager::StopResult>, Error> {
     mutation(api.manager, move |shared| resource_operations::stop_vm(shared, id)).await.map(Json)
 }
+async fn published_ports(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, Error> {
+    let manager = api.manager.lock().await;
+    let vm = manager.vms.get(&id).ok_or_else(missing)?;
+    Ok(Json(json!({"ports":vm.publications.values().map(|p| &p.spec).collect::<Vec<_>>()})))
+}
+
+async fn publish_port(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    Json(spec): Json<Specification>,
+) -> Result<Json<Specification>, Error> {
+    mutation(api.manager, move |shared| publication::publish(shared, id, spec)).await.map(Json)
+}
+
+async fn unpublish_port(
+    State(api): State<Api>,
+    Path((id, protocol, port)): Path<(String, Protocol, u16)>,
+) -> Result<Json<Value>, Error> {
+    mutation(api.manager, move |shared| publication::remove(shared, id, protocol, port)).await?;
+    Ok(Json(json!({"removed":true})))
+}
+
 async fn volumes(State(api): State<Api>) -> Json<serde_json::Value> {
     let manager = api.manager.lock().await;
     Json(

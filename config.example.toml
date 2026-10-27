@@ -3,6 +3,7 @@ api_key_env = "FIRECRACKER_API_KEY"
 jailer = "/usr/local/bin/jailer"
 firecracker = "/usr/local/bin/firecracker"
 state_dir = "/var/lib/mindos-firecracker"
+port_publisher = "/usr/local/libexec/mindos-firecracker/publish-ports.py"
 uid_base = 200000
 max_vms = 4
 
@@ -15,7 +16,7 @@ max_lifetime_secs = 3600
 startup_timeout_secs = 20
 max_connections = 16
 ports = [7000]
-bindings = ["project", "codex"]
+bindings = ["project", "codex", "claude", "dsh"]
 
 # Optional pre-provisioned TAP/netns slots, indexed by the global VM uid slot.
 # Supply max_vms entries; the service never creates NAT or broadens firewall rules.
@@ -33,5 +34,17 @@ size_mib = 2048
 [bindings.codex]
 source = "/srv/harness/codex-home"
 target = "/home/agent/.codex"
+read_only = false
+size_mib = 512
+
+[bindings.claude]
+source = "/srv/harness/claude-home"
+target = "/home/agent/.claude"
+read_only = false
+size_mib = 512
+
+[bindings.dsh]
+source = "/srv/harness/dsh-home"
+target = "/home/agent/.dsh"
 read_only = false
 size_mib = 512

@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+systemctl mask console-getty.service getty@.service serial-getty@.service \
+    apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer \
+    dpkg-db-backup.timer fstrim.timer systemd-pstore.service systemd-networkd-wait-online.service
+systemctl enable systemd-networkd.service systemd-resolved.service \
+    mindos-bindings.service harness-vsock@7000.service ssh.service
+chown -R 1000:1000 /home/agent/.ssh
+chmod 0700 /home/agent/.ssh
+chmod 0600 /home/agent/.ssh/authorized_keys
+# Host keys must be generated independently inside each new root disk.
+rm -f /etc/ssh/ssh_host_*key /etc/ssh/ssh_host_*key.pub
+systemctl set-default multi-user.target
+ln -sf /lib/systemd/system/reboot.target /etc/systemd/system/ctrl-alt-del.target
+truncate -s 0 /etc/machine-id
+# The base layer can already contain files installed before dpkg path filters.
+rm -rf /usr/share/man /usr/share/info /usr/share/locale
+find /usr/share/doc -type f ! -name copyright -delete

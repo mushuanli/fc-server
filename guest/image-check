@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Offline runtime probe, executed as the same user as guest services."""
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import time
+
+
+def probe(program):
+    started = time.monotonic()
+    result = subprocess.run([program, '--version'], capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise RuntimeError(f'{program} version probe failed: exit={result.returncode} {result.stderr[-400:]}')
+    return {'version': result.stdout.strip(), 'probe_ms': round((time.monotonic() - started) * 1000)}
+
+
+def main():
+    flavor = Path('/usr/share/mindos-image/flavor').read_text().strip()
+    for program in ('bash', 'git', 'python3', 'udevadm', 'socat', 'mount'):
+        assert shutil.which(program), f'missing guest component: {program}'
+    assert Path('/usr/lib/systemd/systemd').is_file(), 'missing systemd PID 1'
+    assert not shutil.which('npm'), 'npm must stay in the build stage'
+    packages = subprocess.check_output(['dpkg-query', '-W', '-f=${Package}\n'], text=True).splitlines()
+    assert not any(name.endswith('-dev') for name in packages), 'development packages in runtime image'
+    for unit in ('apt-daily.timer', 'apt-daily-upgrade.timer', 'dpkg-db-backup.timer',
+                 'fstrim.timer', 'systemd-networkd-wait-online.service'):
+        path = Path('/etc/systemd/system') / unit
+        assert path.is_symlink() and path.readlink() == Path('/dev/null'), f'unit must be masked: {unit}'
+    evidence = {'flavor': flavor, 'package_count': len(packages), 'runtimes': {}}
+    if flavor == 'harness':
+        for program in ('node', 'codex', 'claude', 'dsh'):
+            evidence['runtimes'][program] = probe(program)
+    print(json.dumps(evidence))
+
+
+if __name__ == '__main__':
+    main()

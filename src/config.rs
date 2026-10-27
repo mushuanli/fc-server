@@ -14,6 +14,7 @@ pub struct Config {
     pub jailer: PathBuf,
     pub firecracker: PathBuf,
     pub virtiofsd: Option<PathBuf>,
+    pub port_publisher: Option<PathBuf>,
     pub state_dir: PathBuf,
     pub uid_base: u32,
     pub max_vms: usize,
@@ -27,6 +28,11 @@ pub struct Config {
 pub struct Profile {
     pub kernel: PathBuf,
     pub rootfs: PathBuf,
+    #[serde(default)]
+    pub rootfs_mode: RootfsMode,
+    pub initrd: Option<PathBuf>,
+    #[serde(default = "default_upper_size")]
+    pub upper_size_mib: u32,
     pub vcpus: u8,
     pub memory_mib: u32,
     pub max_lifetime_secs: u64,
@@ -37,6 +43,18 @@ pub struct Profile {
     pub bindings: Vec<String>,
     #[serde(default)]
     pub network_slots: Vec<NetworkSlot>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RootfsMode {
+    #[default]
+    Private,
+    Shared,
+}
+
+fn default_upper_size() -> u32 {
+    2048
 }
 
 #[derive(Clone, Deserialize)]
@@ -87,7 +105,7 @@ impl Config {
             self.listen.ip().is_loopback(),
             "listen must be loopback; use an authenticated tunnel for remote access"
         );
-        ensure!((1..=64).contains(&self.max_vms), "max_vms must be 1..64");
+        ensure!((1..=128).contains(&self.max_vms), "max_vms must be 1..128");
         ensure!(
             self.uid_base >= 65536 && self.uid_base.checked_add(self.max_vms as u32).is_some(),
             "invalid dedicated uid range"
@@ -143,9 +161,20 @@ impl Config {
         if let Some(daemon) = &self.virtiofsd {
             trusted(daemon)?;
         }
+        if let Some(helper) = &self.port_publisher {
+            trusted(helper)?;
+        }
         for profile in self.profiles.values() {
             trusted(&profile.kernel)?;
             trusted(&profile.rootfs)?;
+            if let Some(initrd) = &profile.initrd {
+                trusted(initrd)?;
+            }
+            if profile.rootfs_mode == RootfsMode::Shared {
+                use std::os::unix::fs::MetadataExt;
+                let metadata = std::fs::metadata(&profile.rootfs)?;
+                ensure!(metadata.mode() & 0o777 == 0o444, "shared rootfs must have mode 0444");
+            }
             for slot in &profile.network_slots {
                 trusted(&slot.netns)?;
             }
@@ -201,6 +230,11 @@ impl Binding {
 
 impl Profile {
     fn validate(&self) -> Result<()> {
+        ensure!(
+            self.rootfs_mode != RootfsMode::Shared || self.initrd.is_some(),
+            "shared rootfs requires the overlay initrd"
+        );
+        ensure!((64..=65536).contains(&self.upper_size_mib), "upper size must be 64..65536 MiB");
         ensure!(
             (1..=32).contains(&self.vcpus) && (self.vcpus == 1 || self.vcpus.is_multiple_of(2)),
             "vcpus must be 1 or even, at most 32"

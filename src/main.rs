@@ -100,6 +100,9 @@ fn load_key(config: &Config) -> Result<String> {
 
 async fn serve(path: &Path) -> Result<()> {
     let (config, _lock, key) = initialize(path)?;
+    firecracker_server::publication::reset(&config).await.map_err(|e| {
+        anyhow::anyhow!("port publisher initialization failed: {} ({})", e.code, e.stage)
+    })?;
     let volumes = volume::load(&config)?;
     let exports = volumes.keys().map(|id| (id.clone(), Arc::new(Semaphore::new(1)))).collect();
     let listener = tokio::net::TcpListener::bind(config.listen).await?;

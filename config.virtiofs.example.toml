@@ -3,6 +3,7 @@ api_key_env = "FIRECRACKER_API_KEY"
 jailer = "/usr/local/libexec/firecracker-virtiofs/jailer"
 firecracker = "/usr/local/libexec/firecracker-virtiofs/firecracker"
 virtiofsd = "/usr/libexec/virtiofsd"
+port_publisher = "/usr/local/libexec/mindos-firecracker/publish-ports.py"
 state_dir = "/var/lib/mindos-firecracker"
 uid_base = 200000
 max_vms = 4
@@ -10,13 +11,16 @@ max_vms = 4
 [profiles.debian13]
 kernel = "/var/lib/mindos-images/vmlinux"
 rootfs = "/var/lib/mindos-images/debian13.ext4"
+rootfs_mode = "shared"
+initrd = "/var/lib/mindos-images/debian13.ext4.initrd"
+upper_size_mib = 2048
 vcpus = 2
 memory_mib = 1024
 max_lifetime_secs = 3600
 startup_timeout_secs = 30
 max_connections = 16
 ports = [7000]
-bindings = ["project", "codex"]
+bindings = ["project", "codex", "claude", "dsh"]
 
 [bindings.project]
 backend = "virtiofs"
@@ -29,5 +33,19 @@ read_only = false
 backend = "block"
 source = "/srv/harness/codex-home"
 target = "/home/agent/.codex"
+read_only = false
+size_mib = 512
+
+[bindings.claude]
+backend = "block"
+source = "/srv/harness/claude-home"
+target = "/home/agent/.claude"
+read_only = false
+size_mib = 512
+
+[bindings.dsh]
+backend = "block"
+source = "/srv/harness/dsh-home"
+target = "/home/agent/.dsh"
 read_only = false
 size_mib = 512

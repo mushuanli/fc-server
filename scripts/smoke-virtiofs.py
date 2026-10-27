@@ -111,9 +111,28 @@ def share_fixture(fixture):
     smoke.sudo("mount", "--bind", fixture / "private", source / "nested")
 
 
-def read_write(binary, address, key, env, vm, fixture):
+def image_probe(binary, address, vm, env):
+    command = 'if test -x /usr/local/libexec/image-check; then '
+    command += 'printf "IMAGE_INFO="; /usr/local/libexec/image-check; '
+    command += 'else echo "IMAGE_INFO={}"; fi\n'
+    output = smoke.guest(binary, address, vm, env, command, 'IMAGE_INFO=')
+    return json.loads(next(line.removeprefix('IMAGE_INFO=') for line in output.splitlines()
+                           if line.startswith('IMAGE_INFO=')))
+
+
+def host_io(binary, address, vm, env, fixture):
+    assert (fixture / "pinned/.codex/session").read_text() == "session-fixture"
+    assert not (fixture / "replacement/.codex").exists()
+    (fixture / "pinned/from-host").write_text("host-update")
+    smoke.guest(binary, address, vm, env,
+                'test "$(cat /workspace/project/from-host)" = host-update && echo LIVE_HOST_OK\n', "LIVE_HOST_OK")
+
+
+def read_write(binary, address, key, env, vm, fixture, evidence):
     spec = {"id": vm, "profile": "debian13", "directories": ["project"]}
+    started = time.monotonic()
     smoke.request(address, key, "POST", "/v1/vms", spec)
+    evidence['vmm_running_ms'] = round((time.monotonic() - started) * 1000)
     smoke.request(address, key, "POST", "/v1/vms", {**spec, "id": vm + "-busy"}, 409)
     smoke.request(address, key, "POST", "/v1/vms", {**spec, "id": vm + "-alias", "directories": ["alias"]}, 409)
     command = "test $(id -u) = 1000 && test \"$(cat /workspace/project/probe)\" = authorized && "
@@ -122,11 +141,9 @@ def read_write(binary, address, key, env, vm, fixture):
     command += "printf session-fixture > /workspace/project/.codex/pending && "
     command += "mv /workspace/project/.codex/pending /workspace/project/.codex/session && echo LIVE_RW_OK\n"
     smoke.guest(binary, address, vm, env, command, "LIVE_RW_OK")
-    assert (fixture / "pinned/.codex/session").read_text() == "session-fixture"
-    assert not (fixture / "replacement/.codex").exists()
-    (fixture / "pinned/from-host").write_text("host-update")
-    smoke.guest(binary, address, vm, env,
-                'test "$(cat /workspace/project/from-host)" = host-update && echo LIVE_HOST_OK\n', "LIVE_HOST_OK")
+    evidence['guest_ready_ms'] = round((time.monotonic() - started) * 1000)
+    evidence['image'] = image_probe(binary, address, vm, env)
+    host_io(binary, address, vm, env, fixture)
     assert smoke.request(address, key, "DELETE", f"/v1/vms/{vm}")["mode"] == "guest-shutdown"
     assert_empty(vm)
     assert smoke.request(address, key, "GET", "/v1/volumes")["volumes"] == []
@@ -173,13 +190,14 @@ def parent_crash(address, key, spec, process_id):
 
 
 def exercise(binary, root, fixture, daemon, address, key, env, vm, log):
+    evidence = {}
     timeout_case(root, fixture, address, key, env, log, vm)
     smoke.sudo("install", "-m", "0755", daemon, root / "bin/virtiofsd")
     process, process_id = start_server(root, env, log, address, key)
     try:
         (fixture / "source").rename(fixture / "pinned")
         (fixture / "source").symlink_to(fixture / "replacement", target_is_directory=True)
-        spec = read_write(binary, address, key, env, vm, fixture)
+        spec = read_write(binary, address, key, env, vm, fixture, evidence)
         read_only(binary, address, key, env, vm, fixture)
         backend_crash(address, key, spec)
         for kind in ["__supervise", "__supervise-fs"]:
@@ -187,6 +205,7 @@ def exercise(binary, root, fixture, daemon, address, key, env, vm, log):
             assert_empty(vm)
         parent_crash(address, key, spec, process_id)
         process.wait(timeout=15)
+        return evidence
     finally:
         stop_server(process)
 
@@ -219,12 +238,12 @@ def main():
             configure(root, fixture, port)
             add_root_probe(root, fixture)
             with (fixture / "stderr.log").open("wb") as log:
-                exercise(str(binary), root, fixture, daemon, address, key, env, vm, log)
+                evidence = exercise(str(binary), root, fixture, daemon, address, key, env, vm, log)
             assert key not in (fixture / "stderr.log").read_text()
             print(json.dumps({"virtiofs": True, "liveReadWrite": True, "sourcePinned": True,
                 "submountExcluded": True, "hostReadOnly": True, "startupDeadline": True,
                 "backendCrashCleanup": True, "supervisorDeathCleanup": True,
-                "parentDeathCleanup": True, "credentialLogLeak": False}))
+                "parentDeathCleanup": True, "credentialLogLeak": False, "bootEvidence": evidence}))
         except BaseException:
             if (fixture / "stderr.log").exists():
                 descriptor, name = tempfile.mkstemp(prefix="fc-fs-smoke-failure-", suffix=".log", dir="/var/tmp")

@@ -1,0 +1,10 @@
+[Unit]
+Description=Generate a unique SSH host key for this VM
+ConditionFileNotEmpty=/home/agent/.ssh/authorized_keys
+ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
+Before=ssh.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ssh-keygen -q -t ed25519 -N "" -f /etc/ssh/ssh_host_ed25519_key
+RemainAfterExit=yes

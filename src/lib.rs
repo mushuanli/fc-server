@@ -7,6 +7,7 @@ pub mod error;
 pub mod launcher;
 pub mod manager;
 pub mod mount_namespace;
+pub mod publication;
 #[path = "resource-operations.rs"]
 pub mod resource_operations;
 pub mod supervisor;

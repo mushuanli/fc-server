@@ -52,7 +52,8 @@ def provision(binary, kernel, image, root, fixture, port, vmm=None, jailer=None)
         sudo("install", "-m", "0755", source, root / "bin" / name)
     for source, name in [(kernel, "vmlinux"), (image, "debian13.ext4")]:
         sudo("cp", "--reflink=auto", "--sparse=always", source, root / "images" / name)
-        sudo("chmod", "0600", root / "images" / name)
+        # Deployment publishes the shared base read-only; private mode must still copy it writable.
+        sudo("chmod", "0444" if name == "debian13.ext4" else "0600", root / "images" / name)
     config = configuration(root, fixture, port)
     (fixture / "config.toml").write_text(config)
     sudo("install", "-m", "0600", fixture / "config.toml", root / "config.toml")

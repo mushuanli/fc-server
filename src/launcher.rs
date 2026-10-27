@@ -1,5 +1,5 @@
 use crate::{
-    config::{Config, Profile},
+    config::{Config, Profile, RootfsMode},
     error::Error,
     volume::Volume,
 };
@@ -22,8 +22,9 @@ pub fn machine(
     volumes: &[Volume],
     directories: &[String],
 ) -> Value {
+    let shared = profile.rootfs_mode == RootfsMode::Shared;
     let mut drives = vec![
-        json!({"drive_id":"rootfs", "path_on_host":"/rootfs.ext4", "is_root_device":true, "is_read_only":false}),
+        json!({"drive_id":"rootfs", "path_on_host":"/rootfs.ext4", "is_root_device":!shared, "is_read_only":false}),
     ];
     for volume in volumes {
         let binding = &config.bindings[&volume.binding];
@@ -38,6 +39,10 @@ pub fn machine(
     });
     if let Some(name) = directories.first() {
         machine["fs"] = json!([{"fs_id":name,"tag":name,"socket":"/backend/fs.sock"}]);
+    }
+    if shared {
+        machine["boot-source"]["initrd_path"] = json!("/initrd");
+        machine["pmem"] = json!([{"id":"base", "path_on_host":"/base.ext4", "root_device":false, "read_only":true}]);
     }
     machine
 }
@@ -60,8 +65,7 @@ pub async fn prepare(
     tokio::fs::create_dir_all(&root).await.map_err(|e| Error::io("jail_create", e))?;
     copy(&profile.kernel, &root.join("vmlinux"), deadline).await?;
     readonly(&root.join("vmlinux"))?;
-    copy(&profile.rootfs, &root.join("rootfs.ext4"), deadline).await?;
-    chown(&root.join("rootfs.ext4"), uid)?;
+    prepare_root(profile, &root, uid, deadline).await?;
     attach(config, &root, volumes, uid).await?;
     let mut machine = machine(config, profile, volumes, directories);
     if let Some(slot) = network(config, profile, uid)? {
@@ -73,6 +77,73 @@ pub async fn prepare(
         .map_err(|e| Error::io("machine_config_write", e))?;
     readonly(&root.join("machine.json"))?;
     Ok(root)
+}
+
+async fn prepare_root(
+    profile: &Profile,
+    root: &Path,
+    uid: u32,
+    deadline: std::time::Instant,
+) -> Result<(), Error> {
+    if profile.rootfs_mode == RootfsMode::Shared {
+        prepare_shared_root(profile, root, deadline).await?;
+    } else {
+        copy(&profile.rootfs, &root.join("rootfs.ext4"), deadline).await?;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(root.join("rootfs.ext4"), std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| Error::io("rootfs_permissions", e))?;
+    chown(&root.join("rootfs.ext4"), uid)
+}
+
+async fn prepare_shared_root(
+    profile: &Profile,
+    root: &Path,
+    deadline: std::time::Instant,
+) -> Result<(), Error> {
+    let initrd = profile.initrd.as_ref().expect("validated initrd");
+    copy(initrd, &root.join("initrd"), deadline).await?;
+    readonly(&root.join("initrd"))?;
+    tokio::fs::hard_link(&profile.rootfs, root.join("base.ext4"))
+        .await
+        .map_err(|e| Error::io("shared_base_link_same_filesystem", e))?;
+    create_upper(&root.join("rootfs.ext4"), profile.upper_size_mib, deadline).await?;
+    tracing::info!(
+        stage = "rootfs_prepare",
+        mode = "shared",
+        upper_size_mib = profile.upper_size_mib,
+        result = "success"
+    );
+    Ok(())
+}
+
+async fn create_upper(path: &Path, size: u32, deadline: std::time::Instant) -> Result<(), Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| Error::io("upper_create", e))?;
+    file.set_len(u64::from(size) * 1024 * 1024).map_err(|e| Error::io("upper_size", e))?;
+    let mut child = Command::new("/usr/sbin/mkfs.ext4")
+        .env_clear()
+        .args(["-q", "-F", "-m", "0", "-L", "fc-upper"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| Error::io("upper_format", e))?;
+    let status = tokio::time::timeout_at(deadline.into(), child.wait())
+        .await
+        .map_err(|_| Error::unavailable("upper_format_timeout"))?
+        .map_err(|e| Error::io("upper_format_wait", e))?;
+    if !status.success() {
+        return Err(Error::unavailable("upper_format"));
+    }
+    Ok(())
 }
 
 async fn attach(config: &Config, root: &Path, volumes: &[Volume], uid: u32) -> Result<(), Error> {
@@ -173,9 +244,17 @@ fn firecracker_arguments(command: &mut Command) {
 }
 
 fn cgroup_limits(command: &mut Command, profile: &Profile) {
+    let shared_cache = if profile.rootfs_mode == RootfsMode::Shared {
+        std::fs::metadata(&profile.rootfs).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
     command
         .args(["--cgroup-version", "2", "--parent-cgroup", "mindos-firecracker", "--cgroup"])
-        .arg(format!("memory.max={}", (u64::from(profile.memory_mib) + 256) * 1024 * 1024))
+        .arg(format!(
+            "memory.max={}",
+            (u64::from(profile.memory_mib) + 256) * 1024 * 1024 + shared_cache
+        ))
         .args(["--cgroup", "pids.max=128", "--cgroup"])
         .arg(format!("cpu.max={} 100000", u32::from(profile.vcpus) * 100000));
 }

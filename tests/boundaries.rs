@@ -21,6 +21,24 @@ use tower::ServiceExt;
 const KEY: &str = "test-key-with-at-least-thirty-two-characters";
 
 #[test]
+fn shared_root_requires_initrd_and_keeps_base_read_only() {
+    use firecracker_server::config::RootfsMode;
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = config(dir.path());
+    c.max_vms = 100;
+    c.profiles.get_mut("test").unwrap().rootfs_mode = RootfsMode::Shared;
+    assert!(c.validate().unwrap_err().to_string().contains("initrd"));
+    c.profiles.get_mut("test").unwrap().initrd = Some("/initrd".into());
+    c.validate().unwrap();
+    let machine = launcher::machine(&c, &c.profiles["test"], &[], &[]);
+    assert_eq!(machine["pmem"][0]["read_only"], true);
+    assert_eq!(machine["pmem"][0]["path_on_host"], "/base.ext4");
+    assert_eq!(machine["boot-source"]["initrd_path"], "/initrd");
+    assert_eq!(machine["drives"][0]["is_read_only"], false);
+    assert_eq!(machine["drives"][0]["is_root_device"], false);
+}
+
+#[test]
 fn import_errors_keep_distinct_non_sensitive_categories() {
     use firecracker_server::diagnostics::import_category;
     assert_eq!(import_category(b"bwrap: namespace creation failed"), "IMPORT_SANDBOX_REJECTED");
@@ -167,6 +185,8 @@ fn tunnel_manager(config: Config) -> firecracker_server::manager::Shared {
         born: std::time::Instant::now(),
         stop: tokio_util::sync::CancellationToken::new(),
         connections: Arc::new(tokio::sync::Semaphore::new(1)),
+        instance: uuid::Uuid::new_v4().to_string(),
+        publications: BTreeMap::new(),
     };
     Arc::new(Mutex::new(Manager {
         config,

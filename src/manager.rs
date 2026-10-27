@@ -36,6 +36,8 @@ pub struct Vm {
     pub born: Instant,
     pub stop: CancellationToken,
     pub connections: Arc<Semaphore>,
+    pub instance: String,
+    pub publications: BTreeMap<String, crate::publication::Published>,
 }
 
 pub struct PendingVm {
@@ -222,6 +224,8 @@ impl Vm {
             born: Instant::now(),
             stop: CancellationToken::new(),
             connections: Arc::new(Semaphore::new(connections)),
+            instance: uuid::Uuid::new_v4().to_string(),
+            publications: BTreeMap::new(),
         }
     }
 }
