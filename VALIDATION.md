@@ -47,7 +47,7 @@ Debian 制品位于 `/var/tmp/mindos-firecracker-debian13-clean.ext4`。基础�
 
 ## 当前范围
 
-每台 VM 一个 virtio-fs 导出，可混用多个持久块卷；不支持 DAX、热插拔、快照恢复或 daemon 重连。直通无需文件复制同步，但不提供应用事务、写入冲突合并、文件事件通知保证或凭据隔离。没有进行性能基准、aarch64 guest 验收、实际 LLM 联网调用或现有 mindos-node harness driver 的 launcher 集成。本记录验证的是独立隔离服务及其管理/字节流接口。
+每台 VM 一个 virtio-fs 导出，可混用多个持久块卷；不支持 DAX、热插拔、快照恢复或 daemon 重连。直通无需文件复制同步，但不提供应用事务、写入冲突合并、文件事件通知保证或凭据隔离。没有进行性能基准、aarch64 guest 验收、实际 LLM 联网调用或现有 nestos-node harness driver 的 launcher 集成。本记录验证的是独立隔离服务及其管理/字节流接口。
 
 ## 并发审查修复
 
